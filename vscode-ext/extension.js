@@ -28,7 +28,18 @@ const vscode = require("vscode");
 const state = {
   sidebar: null, // our WebviewView, when visible
   output: null, // OutputChannel
+  extensionUri: null, // set in activate; used for tab icons
+  activeSessionId: null, // session of the most recently active session tab
 };
+
+function pushActiveSession(id) {
+  state.activeSessionId = id;
+  try {
+    state.sidebar?.webview.postMessage({ type: "activeSession", id });
+  } catch {
+    /* view disposed */
+  }
+}
 
 const panels = new Map(); // sessionId -> WebviewPanel (plus HOME_KEY for the home tab)
 const HOME_KEY = Symbol("home");
@@ -123,6 +134,7 @@ async function sendSessions() {
       sessions: result.sessions,
       error: result.error,
       workspace: workspaceDir(),
+      activeId: state.activeSessionId,
     });
   } catch {
     /* view disposed mid-flight */
@@ -317,8 +329,21 @@ function loadingHtml(text) {
 
 function trackPanel(key, panel) {
   panels.set(key, panel);
+  if (state.extensionUri) {
+    // Vendor ships the "OC" mark in themed variants (black for light, white for dark).
+    panel.iconPath = {
+      light: vscode.Uri.joinPath(state.extensionUri, "images", "button-dark.svg"),
+      dark: vscode.Uri.joinPath(state.extensionUri, "images", "button-light.svg"),
+    };
+  }
+  // Highlight follows the active tab: session tabs set it, the home tab clears it.
+  panel.onDidChangeViewState((e) => {
+    if (e.webviewPanel.active) pushActiveSession(typeof key === "string" ? key : null);
+  });
+  if (panel.active) pushActiveSession(typeof key === "string" ? key : null);
   panel.onDidDispose(() => {
     if (panels.get(key) === panel) panels.delete(key);
+    if (typeof key === "string" && state.activeSessionId === key) pushActiveSession(null);
   });
 }
 
@@ -459,6 +484,8 @@ function sidebarHtml() {
   ul { list-style: none; margin: 0; padding: 0; }
   li.session { padding: 5px 6px; border-radius: 4px; cursor: pointer; }
   li.session:hover { background: var(--vscode-list-hoverBackground); }
+  li.session.active { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+  li.session.active .meta { color: inherit; opacity: 0.75; }
   li.session .title { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   li.session .meta { display: block; font-size: 0.85em; color: var(--vscode-descriptionForeground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .empty, .error { color: var(--vscode-descriptionForeground); padding: 8px 2px; }
@@ -474,6 +501,7 @@ function sidebarHtml() {
   const vscode = acquireVsCodeApi();
   let sessions = [];
   let workspace = "";
+  let activeId = null;
 
   document.getElementById("new").addEventListener("click", () => vscode.postMessage({ type: "newSession" }));
   document.getElementById("search").addEventListener("input", render);
@@ -500,7 +528,7 @@ function sidebarHtml() {
     }
     for (const s of shown) {
       const li = document.createElement("li");
-      li.className = "session";
+      li.className = s.id === activeId ? "session active" : "session";
       li.title = s.directory;
       const t = document.createElement("span");
       t.className = "title";
@@ -518,9 +546,15 @@ function sidebarHtml() {
 
   window.addEventListener("message", (e) => {
     const msg = e.data;
+    if (msg.type === "activeSession") {
+      activeId = msg.id || null;
+      render();
+      return;
+    }
     if (msg.type !== "sessions") return;
     sessions = msg.sessions || [];
     workspace = msg.workspace || "";
+    if ("activeId" in msg) activeId = msg.activeId || null;
     document.getElementById("status").textContent = "";
     if (msg.error) {
       const d = document.createElement("div");
@@ -544,6 +578,7 @@ function sidebarHtml() {
 let dbWatcher = null;
 
 function activate(context) {
+  state.extensionUri = context.extensionUri;
   state.output = vscode.window.createOutputChannel("OpenCode Sidebar");
   context.subscriptions.push(state.output);
 

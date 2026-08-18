@@ -563,6 +563,15 @@ function activate(context) {
   context.subscriptions.push(
     vscode.commands.registerCommand("opencode-v2.newSession", () => newSession())
   );
+  context.subscriptions.push(
+    vscode.commands.registerCommand("opencode-v2.openHome", () => openHome())
+  );
+  context.subscriptions.push(
+    vscode.commands.registerCommand("opencode-v2.openExternal", async () => {
+      // Full web UI (own tab bar, review panel, terminal) in the default browser.
+      if (await ensureServer()) vscode.env.openExternal(vscode.Uri.parse(SERVER_URL));
+    })
+  );
 
   // Refresh the list when opencode writes to its db (debounced).
   try {

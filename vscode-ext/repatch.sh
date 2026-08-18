@@ -42,12 +42,16 @@ if not views or views[0].get('type') != 'webview':
     d['activationEvents'] = sorted(set(d.get('activationEvents', []) + ['onView:opencode-v2.panel']))
     cmds = {x['command'] for x in c.setdefault('commands', [])}
     for cmd, title, icon in [('opencode-v2.refreshSessions', 'OpenCode: Refresh Sessions', '$(refresh)'),
-                             ('opencode-v2.newSession', 'OpenCode: New Session', '$(add)')]:
+                             ('opencode-v2.newSession', 'OpenCode: New Session', '$(add)'),
+                             ('opencode-v2.openHome', 'OpenCode: Home', '$(home)'),
+                             ('opencode-v2.openExternal', 'OpenCode: Open in Browser', '$(link-external)')]:
         if cmd not in cmds:
             c['commands'].append({'command': cmd, 'title': title, 'icon': icon})
     c.setdefault('menus', {})['view/title'] = [
         {'command': 'opencode-v2.newSession', 'when': 'view == opencode-v2.panel', 'group': 'navigation@1'},
         {'command': 'opencode-v2.refreshSessions', 'when': 'view == opencode-v2.panel', 'group': 'navigation@2'},
+        {'command': 'opencode-v2.openHome', 'when': 'view == opencode-v2.panel', 'group': 'navigation@3'},
+        {'command': 'opencode-v2.openExternal', 'when': 'view == opencode-v2.panel', 'group': 'navigation@4'},
     ]
     json.dump(d, open(p, 'w'), indent=2)
     print('package.json patched')

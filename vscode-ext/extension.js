@@ -253,8 +253,19 @@ async function navigatePanel(url) {
   }
 }
 
+function sessionDeepLink(sessionId) {
+  // sessionId is interpolated into webview HTML; accept only the id shape
+  // opencode generates (ses_ + alphanumerics) so no markup can ride along.
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) {
+    log(`rejected malformed session id: ${JSON.stringify(String(sessionId)).slice(0, 200)}`);
+    return null;
+  }
+  return `${SERVER_URL}/server/${SERVER_SLUG}/session/${encodeURIComponent(sessionId)}`;
+}
+
 function openSession(sessionId) {
-  return navigatePanel(`${SERVER_URL}/server/${SERVER_SLUG}/session/${sessionId}`);
+  const url = sessionDeepLink(sessionId);
+  return url ? navigatePanel(url) : Promise.resolve(false);
 }
 
 async function newSession() {
@@ -267,7 +278,9 @@ async function newSession() {
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const session = await res.json();
-    await navigatePanel(`${SERVER_URL}/server/${SERVER_SLUG}/session/${session.id}`);
+    const url = sessionDeepLink(session.id);
+    if (!url) throw new Error("unexpected session id in server response");
+    await navigatePanel(url);
   } catch (e) {
     log(`create session failed (${e.message}); falling back to web UI home`);
     await navigatePanel(SERVER_URL);

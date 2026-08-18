@@ -3,9 +3,10 @@
 // vendor package.json declares but never implements ("no data provider" error).
 //
 // Sidebar features: "+ New session", session search, list of sessions for the
-// current workspace (read from opencode's sqlite db). Clicking a session opens
-// the vendor assistant panel and switches it to that session by invoking the
-// vendor's own webview message handler, captured via a require("vscode") shim.
+// current workspace (read from opencode's sqlite db). The vendor panel is an
+// iframe onto the opencode server's web UI, so clicking a session opens the
+// panel and points that iframe at the session's deep-link URL. The panel is
+// captured via a require("vscode") shim around the vendor bundle.
 //
 // NOTE: wiped by any extension update — see repatch script.
 
@@ -21,7 +22,6 @@ const vscode = require("vscode");
 const state = {
   panel: null, // vendor's WebviewPanel, when open
   handler: null, // vendor's webview message handler: (msg) => Promise
-  webviewReady: false, // panel webview UI has sent its first message
   sidebar: null, // our WebviewView, when visible
   output: null, // OutputChannel
 };
@@ -53,21 +53,15 @@ function facade(obj, overrides) {
 }
 
 function hookPanel(panel) {
-  state.webviewReady = false;
   try {
     const web = panel.webview;
     const orig = web.onDidReceiveMessage.bind(web);
     Object.defineProperty(web, "onDidReceiveMessage", {
       configurable: true,
       value: (listener, thisArg, disposables) => {
+        // Registration marks the vendor's panel as fully constructed.
         state.handler = (msg) => Promise.resolve(listener.call(thisArg, msg));
-        // Snoop inbound messages: the first one means the webview UI has booted
-        // and can receive state updates (cold-start switchSession would be lost before that).
-        const snoop = (msg) => {
-          state.webviewReady = true;
-          return listener.call(thisArg, msg);
-        };
-        return orig(snoop, thisArg, disposables);
+        return orig(listener, thisArg, disposables);
       },
     });
   } catch (e) {
@@ -80,7 +74,6 @@ function hookPanel(panel) {
     if (state.panel !== panel) return;
     state.panel = null;
     state.handler = null;
-    state.webviewReady = false;
     sendSessions();
   });
 }
@@ -208,10 +201,6 @@ function ensurePanel() {
           vscode.window.showErrorMessage("OpenCode: assistant panel did not become ready.");
           return false;
         }
-        // Grace for the panel's webview UI to boot (it loads its bundle and
-        // restores its own state); a switchSession sent into that boot window
-        // can be overridden by the UI's own session restore.
-        if (!state.webviewReady) await sleep(1500);
         return true;
       } finally {
         panelOpening = null;
@@ -221,32 +210,70 @@ function ensurePanel() {
   return panelOpening;
 }
 
-async function sendToPanel(msg) {
-  if (!(await ensurePanel())) return false;
-  const handler = state.handler; // snapshot: dispose may null it under us
-  if (typeof handler !== "function") {
-    log(`panel handler gone before ${msg.type} could be sent`);
-    vscode.window.showErrorMessage("OpenCode: panel closed before the action completed — try again.");
-    return false;
-  }
-  try {
-    await handler(msg);
-    return true;
-  } catch (e) {
-    log(`${msg.type} failed: ${e.message}`);
-    vscode.window.showErrorMessage(`OpenCode: ${msg.type} failed (${e.message})`);
-    return false;
-  }
+// The vendor panel is just an iframe onto the opencode server's web UI at
+// http://127.0.0.1:4096 (its outer HTML has no script, so the vendor's own
+// postMessage-based switchSession can never reach the UI). Navigation is the
+// working lever: the web UI deep-links sessions at
+//   /server/{base64url(serverUrl)}/session/{sessionId}
+const SERVER_URL = "http://127.0.0.1:4096";
+const SERVER_SLUG = Buffer.from(SERVER_URL, "utf8")
+  .toString("base64")
+  .replace(/\+/g, "-")
+  .replace(/\//g, "_")
+  .replace(/=/g, "");
+
+function iframeHtml(src) {
+  // Mirrors the vendor's getHtmlForWebview, with a parameterized URL.
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+    iframe { width: 100%; height: 100%; border: none; }
+  </style>
+</head>
+<body>
+  <iframe src="${src}" allow="clipboard-read; clipboard-write"></iframe>
+</body>
+</html>`;
 }
 
-async function newSession() {
-  await sendToPanel({ type: "createSession" });
-  await sleep(800);
-  sendSessions();
+async function navigatePanel(url) {
+  if (!(await ensurePanel())) return false;
+  const panel = state.panel;
+  if (!panel) return false;
+  try {
+    panel.webview.html = iframeHtml(url);
+    panel.reveal(undefined, false);
+    return true;
+  } catch (e) {
+    log(`navigate failed: ${e.message}`);
+    return false;
+  }
 }
 
 function openSession(sessionId) {
-  return sendToPanel({ type: "switchSession", data: { sessionId } });
+  return navigatePanel(`${SERVER_URL}/server/${SERVER_SLUG}/session/${sessionId}`);
+}
+
+async function newSession() {
+  if (!(await ensurePanel())) return;
+  try {
+    const res = await fetch(`${SERVER_URL}/session?directory=${encodeURIComponent(workspaceDir())}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const session = await res.json();
+    await navigatePanel(`${SERVER_URL}/server/${SERVER_SLUG}/session/${session.id}`);
+  } catch (e) {
+    log(`create session failed (${e.message}); falling back to web UI home`);
+    await navigatePanel(SERVER_URL);
+  }
+  await sleep(800);
+  sendSessions();
 }
 
 // ---------------------------------------------------------------------------

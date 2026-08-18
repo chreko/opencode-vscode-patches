@@ -2,11 +2,15 @@
 // Adds a working sidebar (WebviewView) for the "opencode-v2.panel" view that the
 // vendor package.json declares but never implements ("no data provider" error).
 //
-// Sidebar features: "+ New session", session search, list of sessions for the
-// current workspace (read from opencode's sqlite db). The vendor panel is an
-// iframe onto the opencode server's web UI, so clicking a session opens the
-// panel and points that iframe at the session's deep-link URL. The panel is
-// captured via a require("vscode") shim around the vendor bundle.
+// The vendor's assistant panel is a bare iframe onto the opencode server's web
+// UI (http://127.0.0.1:4096); its postMessage plumbing never reaches that UI.
+// This wrapper therefore bypasses the vendor panel entirely: it manages the
+// `opencode serve` process itself and opens ONE editor tab per session, each an
+// iframe on the session's deep-link URL. The sidebar lists the current
+// workspace's sessions (read from opencode's sqlite db); clicking one opens or
+// reveals its tab. The vendor's openPanel command (Ctrl+Escape) is intercepted
+// to open a web-UI home tab against our server instead of crashing on the
+// occupied port.
 //
 // NOTE: wiped by any extension update — see repatch script.
 
@@ -15,26 +19,29 @@
 const path = require("path");
 const os = require("os");
 const fs = require("fs");
-const { execFile } = require("child_process");
+const http = require("http");
+const net = require("net");
+const { execFile, spawn } = require("child_process");
 const Module = require("module");
 const vscode = require("vscode");
 
 const state = {
-  panel: null, // vendor's WebviewPanel, when open
-  handler: null, // vendor's webview message handler: (msg) => Promise
   sidebar: null, // our WebviewView, when visible
   output: null, // OutputChannel
 };
+
+const panels = new Map(); // sessionId -> WebviewPanel (plus HOME_KEY for the home tab)
+const HOME_KEY = Symbol("home");
 
 function log(msg) {
   if (state.output) state.output.appendLine(`[sidebar] ${msg}`);
 }
 
 // ---------------------------------------------------------------------------
-// Capture the vendor's panel + message handler.
-// The vendor bundle requires "vscode" at module top level; we hand it a facade
-// whose window.createWebviewPanel notes the panel and shadows
-// webview.onDidReceiveMessage to capture the listener the vendor registers.
+// Vendor bundle: load it through a require("vscode") shim so we can replace
+// the openPanel command it registers. The rest of its activate (output
+// channel, refreshPanel command) runs untouched — but its own panel and
+// server management are never used.
 // ---------------------------------------------------------------------------
 
 function facade(obj, overrides) {
@@ -52,50 +59,17 @@ function facade(obj, overrides) {
   return Object.assign(f, overrides);
 }
 
-function hookPanel(panel) {
-  try {
-    const web = panel.webview;
-    const orig = web.onDidReceiveMessage.bind(web);
-    Object.defineProperty(web, "onDidReceiveMessage", {
-      configurable: true,
-      value: (listener, thisArg, disposables) => {
-        // Registration marks the vendor's panel as fully constructed.
-        state.handler = (msg) => Promise.resolve(listener.call(thisArg, msg));
-        return orig(listener, thisArg, disposables);
-      },
-    });
-  } catch (e) {
-    log(`could not hook panel message handler: ${e.message}`);
-  }
-  state.panel = panel;
-  panel.onDidDispose(() => {
-    // Guard: an old panel's dispose can fire after a new panel was hooked —
-    // only clear state that still belongs to this panel.
-    if (state.panel !== panel) return;
-    state.panel = null;
-    state.handler = null;
-    sendSessions();
-  });
-}
-
-const windowFacade = facade(vscode.window, {
-  createWebviewPanel: (viewType, title, showOptions, options) => {
-    const panel = vscode.window.createWebviewPanel(viewType, title, showOptions, options);
-    if (viewType === "opencode-v2-assistant") hookPanel(panel);
-    return panel;
+const commandsFacade = facade(vscode.commands, {
+  registerCommand: (id, cb, thisArg) => {
+    if (id === "opencode-v2.openPanel") {
+      // Vendor's panel would spawn a second server on the same fixed port and
+      // die with ServeError; give the keybinding a working home tab instead.
+      return vscode.commands.registerCommand(id, () => openHome());
+    }
+    return vscode.commands.registerCommand(id, cb, thisArg);
   },
 });
-// The vendor force-moves its panel into a floating window right after opening
-// it (workbench.action.moveEditorToNewWindow). Swallow that so the assistant
-// stays a normal editor tab; everything else passes through.
-const commandsFacade = facade(vscode.commands, {
-  executeCommand: (cmd, ...args) =>
-    cmd === "workbench.action.moveEditorToNewWindow"
-      ? Promise.resolve()
-      : vscode.commands.executeCommand(cmd, ...args),
-});
-
-const vscodeFacade = facade(vscode, { window: windowFacade, commands: commandsFacade });
+const vscodeFacade = facade(vscode, { commands: commandsFacade });
 
 const vendorPath = path.join(__dirname, "extension.vendor.js");
 const origLoad = Module._load;
@@ -149,7 +123,6 @@ async function sendSessions() {
       sessions: result.sessions,
       error: result.error,
       workspace: workspaceDir(),
-      panelOpen: !!state.panel,
     });
   } catch {
     /* view disposed mid-flight */
@@ -157,18 +130,15 @@ async function sendSessions() {
 }
 
 // ---------------------------------------------------------------------------
-// Driving the vendor panel.
+// Server lifecycle. The web UI needs `opencode serve` on the fixed port 4096.
+// We own the process: reap orphans from dead extension hosts at activation,
+// spawn on demand, kill on deactivate.
 // ---------------------------------------------------------------------------
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// The vendor hardcodes port 4096, does not handle "port already in use" (its
-// spawn dies with ServeError and the client never initializes), and leaks its
-// server child on window reload. The server deliberately outlives the panel
-// (the vendor app persists for panel reuse), so within a session a running
-// server is never stale — only one surviving from a previous extension host
-// is. Therefore: reap once at activation, and kill our own on deactivate.
+const SERVER_URL = "http://127.0.0.1:4096";
 const SERVE_PATTERN = "opencode serve --hostname=127\\.0\\.0\\.1 --port=4096";
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function reapStaleServer() {
   return new Promise((resolve) => {
@@ -179,51 +149,151 @@ function reapStaleServer() {
   });
 }
 
-// Single-flight: concurrent sidebar clicks while the panel is still starting
-// share ONE open attempt.
-let panelOpening = null;
-
-function ensurePanel() {
-  if (state.panel && state.handler) {
-    try {
-      state.panel.reveal(undefined, false);
-    } catch {}
-    return Promise.resolve(true);
+async function serverHealthy() {
+  try {
+    const res = await fetch(`${SERVER_URL}/health`, { signal: AbortSignal.timeout(1500) });
+    return res.ok;
+  } catch {
+    return false;
   }
-  if (!panelOpening) {
-    panelOpening = (async () => {
+}
+
+let serverProc = null;
+let serverStarting = null; // single-flight
+
+function ensureServer() {
+  if (!serverStarting) {
+    serverStarting = (async () => {
       try {
-        // The vendor's openPanel command awaits its full init (server spawn,
-        // model load, panel creation) before resolving.
-        await vscode.commands.executeCommand("opencode-v2.openPanel");
-        for (let i = 0; i < 150 && !state.handler; i++) await sleep(100); // safety net
-        if (!state.handler) {
-          vscode.window.showErrorMessage("OpenCode: assistant panel did not become ready.");
-          return false;
+        if (await serverHealthy()) return true;
+        if (await reapStaleServer()) await sleep(500); // unhealthy squatter — clear the port
+        const ws = workspaceDir();
+        log(`starting opencode serve (workspace: ${ws})`);
+        serverProc = spawn("opencode", ["serve", "--hostname=127.0.0.1", "--port=4096"], {
+          env: { ...process.env, PWD: ws, OPENCODE_WORKSPACE: ws },
+          stdio: "ignore",
+        });
+        serverProc.on("exit", (code) => log(`opencode serve exited (code ${code})`));
+        serverProc.on("error", (e) => log(`opencode serve spawn error: ${e.message}`));
+        for (let i = 0; i < 100; i++) {
+          if (await serverHealthy()) return true;
+          await sleep(200);
         }
-        return true;
+        vscode.window.showErrorMessage("OpenCode: server did not become healthy on port 4096.");
+        return false;
       } finally {
-        panelOpening = null;
+        serverStarting = null;
       }
     })();
   }
-  return panelOpening;
+  return serverStarting;
 }
 
-// The vendor panel is just an iframe onto the opencode server's web UI at
-// http://127.0.0.1:4096 (its outer HTML has no script, so the vendor's own
-// postMessage-based switchSession can never reach the UI). Navigation is the
-// working lever: the web UI deep-links sessions at
-//   /server/{base64url(serverUrl)}/session/{sessionId}
-const SERVER_URL = "http://127.0.0.1:4096";
-const SERVER_SLUG = Buffer.from(SERVER_URL, "utf8")
-  .toString("base64")
-  .replace(/\+/g, "-")
-  .replace(/\//g, "_")
-  .replace(/=/g, "");
+// ---------------------------------------------------------------------------
+// Injecting proxy: the web UI has no embed mode, so each tab loads the app
+// through a local proxy that forwards to the opencode server and injects one
+// CSS rule hiding the app's internal tab bar (header[data-slot=titlebar-v2]).
+// The deep link's /server/{b64} segment points at the proxy too, so all API
+// and SSE traffic stays same-origin through it.
+// ---------------------------------------------------------------------------
 
-function iframeHtml(src) {
-  // Mirrors the vendor's getHtmlForWebview, with a parameterized URL.
+const INJECT_CSS = `<style id="oc-vscode-embed">header[data-slot="titlebar-v2"]{display:none !important}</style>`;
+
+let proxyServer = null;
+let proxyUrl = null;
+let proxyStarting = null; // single-flight
+
+function ensureProxy() {
+  if (proxyUrl) return Promise.resolve(proxyUrl);
+  if (!proxyStarting) {
+    proxyStarting = new Promise((resolve) => {
+      proxyServer = http.createServer((req, res) => {
+        const headers = { ...req.headers, host: "127.0.0.1:4096" };
+        delete headers["accept-encoding"]; // identity encoding so HTML is injectable
+        const up = http.request({ hostname: "127.0.0.1", port: 4096, path: req.url, method: req.method, headers }, (ur) => {
+          const ct = ur.headers["content-type"] || "";
+          if (ct.includes("text/html")) {
+            const chunks = [];
+            ur.on("data", (c) => chunks.push(c));
+            ur.on("end", () => {
+              let html = Buffer.concat(chunks).toString("utf8");
+              html = html.includes("</head>") ? html.replace("</head>", INJECT_CSS + "</head>") : INJECT_CSS + html;
+              const h = { ...ur.headers };
+              delete h["content-length"];
+              delete h["content-encoding"];
+              res.writeHead(ur.statusCode, h);
+              res.end(html);
+            });
+          } else {
+            res.writeHead(ur.statusCode, ur.headers);
+            ur.pipe(res);
+          }
+        });
+        up.on("error", () => {
+          if (!res.headersSent) res.writeHead(502);
+          res.end("opencode server unreachable");
+        });
+        req.pipe(up);
+      });
+      // Tunnel WebSocket upgrades transparently.
+      proxyServer.on("upgrade", (req, socket, head) => {
+        const upstream = net.connect(4096, "127.0.0.1", () => {
+          let raw = `${req.method} ${req.url} HTTP/1.1\r\n`;
+          for (let i = 0; i < req.rawHeaders.length; i += 2) {
+            const name = req.rawHeaders[i];
+            const value = name.toLowerCase() === "host" ? "127.0.0.1:4096" : req.rawHeaders[i + 1];
+            raw += `${name}: ${value}\r\n`;
+          }
+          raw += "\r\n";
+          upstream.write(raw);
+          if (head && head.length) upstream.write(head);
+          upstream.pipe(socket);
+          socket.pipe(upstream);
+        });
+        const drop = () => {
+          socket.destroy();
+          upstream.destroy();
+        };
+        upstream.on("error", drop);
+        socket.on("error", drop);
+      });
+      proxyServer.on("error", (e) => {
+        log(`proxy error: ${e.message}`);
+        resolve(null);
+      });
+      proxyServer.listen(0, "127.0.0.1", () => {
+        proxyUrl = `http://127.0.0.1:${proxyServer.address().port}`;
+        log(`embed proxy on ${proxyUrl}`);
+        resolve(proxyUrl);
+      });
+    }).finally(() => {
+      proxyStarting = null;
+    });
+  }
+  return proxyStarting;
+}
+
+// ---------------------------------------------------------------------------
+// Session tabs: one WebviewPanel per session, iframe on the deep-link URL.
+// ---------------------------------------------------------------------------
+
+function b64url(s) {
+  return Buffer.from(s, "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+}
+
+function sessionDeepLink(base, sessionId) {
+  // sessionId is interpolated into webview HTML; accept only the id shape
+  // opencode generates so no markup can ride along.
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) {
+    log(`rejected malformed session id: ${JSON.stringify(String(sessionId)).slice(0, 200)}`);
+    return null;
+  }
+  return `${base}/server/${b64url(base)}/session/${encodeURIComponent(sessionId)}`;
+}
+
+function iframeHtml(src, persistState) {
+  // persistState (validated session id or null) lets the serializer restore
+  // this tab after a window reload.
   return `<!DOCTYPE html>
 <html>
 <head>
@@ -231,45 +301,78 @@ function iframeHtml(src) {
   <style>
     body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
     iframe { width: 100%; height: 100%; border: none; }
+    p { color: var(--vscode-descriptionForeground); font-family: var(--vscode-font-family); padding: 12px; }
   </style>
 </head>
 <body>
   <iframe src="${src}" allow="clipboard-read; clipboard-write"></iframe>
+  <script>try { acquireVsCodeApi().setState({ sessionId: ${JSON.stringify(persistState)} }); } catch (e) {}</script>
 </body>
 </html>`;
 }
 
-async function navigatePanel(url) {
-  if (!(await ensurePanel())) return false;
-  const panel = state.panel;
-  if (!panel) return false;
+function loadingHtml(text) {
+  return `<!DOCTYPE html><html><body style="font-family: var(--vscode-font-family); color: var(--vscode-descriptionForeground); padding: 12px;">${text}</body></html>`;
+}
+
+function trackPanel(key, panel) {
+  panels.set(key, panel);
+  panel.onDidDispose(() => {
+    if (panels.get(key) === panel) panels.delete(key);
+  });
+}
+
+async function fillPanel(panel, sessionId) {
+  // sessionId null = home tab
+  const base = (await ensureServer()) ? await ensureProxy() : null;
+  if (!base) {
+    try {
+      panel.webview.html = loadingHtml("OpenCode server failed to start. Close this tab and try again.");
+    } catch {}
+    return false;
+  }
+  const url = sessionId ? sessionDeepLink(base, sessionId) : base;
+  if (!url) return false;
   try {
-    panel.webview.html = iframeHtml(url);
-    panel.reveal(undefined, false);
+    panel.webview.html = iframeHtml(url, sessionId);
     return true;
   } catch (e) {
-    log(`navigate failed: ${e.message}`);
+    log(`fillPanel failed: ${e.message}`);
     return false;
   }
 }
 
-function sessionDeepLink(sessionId) {
-  // sessionId is interpolated into webview HTML; accept only the id shape
-  // opencode generates (ses_ + alphanumerics) so no markup can ride along.
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) {
-    log(`rejected malformed session id: ${JSON.stringify(String(sessionId)).slice(0, 200)}`);
-    return null;
+function openTab(key, sessionId, title) {
+  const existing = panels.get(key);
+  if (existing) {
+    try {
+      existing.reveal(undefined, false);
+    } catch {}
+    return existing;
   }
-  return `${SERVER_URL}/server/${SERVER_SLUG}/session/${encodeURIComponent(sessionId)}`;
+  const panel = vscode.window.createWebviewPanel(
+    "opencode-session",
+    title || "OpenCode",
+    vscode.ViewColumn.Active,
+    { enableScripts: true, retainContextWhenHidden: true }
+  );
+  panel.webview.html = loadingHtml("Starting OpenCode…");
+  trackPanel(key, panel);
+  fillPanel(panel, sessionId);
+  return panel;
 }
 
-function openSession(sessionId) {
-  const url = sessionDeepLink(sessionId);
-  return url ? navigatePanel(url) : Promise.resolve(false);
+function openSession(sessionId, title) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) return;
+  openTab(sessionId, sessionId, title);
+}
+
+function openHome() {
+  openTab(HOME_KEY, null, "OpenCode");
 }
 
 async function newSession() {
-  if (!(await ensurePanel())) return;
+  if (!(await ensureServer())) return;
   try {
     const res = await fetch(`${SERVER_URL}/session?directory=${encodeURIComponent(workspaceDir())}`, {
       method: "POST",
@@ -278,15 +381,27 @@ async function newSession() {
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const session = await res.json();
-    const url = sessionDeepLink(session.id);
-    if (!url) throw new Error("unexpected session id in server response");
-    await navigatePanel(url);
+    if (typeof session.id === "string") {
+      openSession(session.id, session.title || "New session");
+    } else {
+      throw new Error("unexpected session id in server response");
+    }
   } catch (e) {
-    log(`create session failed (${e.message}); falling back to web UI home`);
-    await navigatePanel(SERVER_URL);
+    log(`create session failed (${e.message}); opening web UI home instead`);
+    openHome();
   }
   await sleep(800);
   sendSessions();
+}
+
+// Restore session tabs across window reloads.
+class SessionPanelSerializer {
+  async deserializeWebviewPanel(panel, saved) {
+    const sessionId = saved && typeof saved.sessionId === "string" ? saved.sessionId : null;
+    trackPanel(sessionId || HOME_KEY, panel);
+    panel.webview.html = loadingHtml("Starting OpenCode…");
+    await fillPanel(panel, sessionId);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +423,7 @@ class SessionsSidebarProvider {
           newSession();
           break;
         case "openSession":
-          if (m.id) openSession(m.id);
+          if (typeof m.id === "string") openSession(m.id, typeof m.title === "string" ? m.title : undefined);
           break;
       }
     });
@@ -396,7 +511,7 @@ function sidebarHtml() {
       m.textContent = relTime(s.time_updated) + sub;
       li.appendChild(t);
       li.appendChild(m);
-      li.addEventListener("click", () => vscode.postMessage({ type: "openSession", id: s.id }));
+      li.addEventListener("click", () => vscode.postMessage({ type: "openSession", id: s.id, title: s.title }));
       list.appendChild(li);
     }
   }
@@ -433,11 +548,14 @@ function activate(context) {
   context.subscriptions.push(state.output);
 
   // Fresh extension host: any opencode serve still on 4096 belongs to a dead
-  // host (the vendor leaks it on reload) and would make the next spawn fail.
+  // host (spawns are leaked on reload) and would block our own spawn.
   reapStaleServer();
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider("opencode-v2.panel", new SessionsSidebarProvider())
+  );
+  context.subscriptions.push(
+    vscode.window.registerWebviewPanelSerializer("opencode-session", new SessionPanelSerializer())
   );
   context.subscriptions.push(
     vscode.commands.registerCommand("opencode-v2.refreshSessions", () => sendSessions())
@@ -465,8 +583,14 @@ function activate(context) {
 }
 
 function deactivate() {
-  // Don't leak the vendor's server child across window reloads (it would hold
-  // port 4096 and make the next panel open fail with ServeError).
+  try {
+    if (proxyServer) proxyServer.close();
+  } catch {}
+  // Don't leak the server across window reloads (it would hold port 4096 and
+  // block the next spawn).
+  try {
+    if (serverProc && !serverProc.killed) serverProc.kill();
+  } catch {}
   try {
     require("child_process").execFileSync("pkill", ["-f", SERVE_PATTERN]);
   } catch {

@@ -2,7 +2,8 @@
 # Re-apply local patches to the sst-dev.opencode-v2 VS Code extension after an update:
 #  1. win32 spawn fix (anomalyco/opencode#38376)
 #  2. sessions sidebar wrapper (extension.js -> extension.vendor.js + wrapper)
-# Canonical wrapper source: ~/opt/opencode/vscode-ext/extension.js
+# Wrapper source is this script's own directory (see SRC_DIR below) — the git
+# checkout is canonical, since an extension update wipes the installed copy.
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"

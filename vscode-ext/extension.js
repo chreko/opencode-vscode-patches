@@ -135,6 +135,7 @@ async function sendSessions() {
       error: result.error,
       workspace: workspaceDir(),
       activeId: state.activeSessionId,
+      openIds: [...panels.keys()].filter((k) => typeof k === "string"),
     });
   } catch {
     /* view disposed mid-flight */
@@ -344,7 +345,9 @@ function trackPanel(key, panel) {
   panel.onDidDispose(() => {
     if (panels.get(key) === panel) panels.delete(key);
     if (typeof key === "string" && state.activeSessionId === key) pushActiveSession(null);
+    sendSessions(); // open-in-tab indicators
   });
+  sendSessions();
 }
 
 async function fillPanel(panel, sessionId) {
@@ -367,7 +370,7 @@ async function fillPanel(panel, sessionId) {
   }
 }
 
-function openTab(key, sessionId, title) {
+function openTab(key, sessionId, title, viewColumn) {
   const existing = panels.get(key);
   if (existing) {
     try {
@@ -378,7 +381,7 @@ function openTab(key, sessionId, title) {
   const panel = vscode.window.createWebviewPanel(
     "opencode-session",
     title || "OpenCode",
-    vscode.ViewColumn.Active,
+    viewColumn || vscode.ViewColumn.Active,
     { enableScripts: true, retainContextWhenHidden: true }
   );
   panel.webview.html = loadingHtml("Starting OpenCode…");
@@ -387,16 +390,16 @@ function openTab(key, sessionId, title) {
   return panel;
 }
 
-function openSession(sessionId, title) {
+function openSession(sessionId, title, viewColumn) {
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) return;
-  openTab(sessionId, sessionId, title);
+  openTab(sessionId, sessionId, title, viewColumn);
 }
 
 function openHome() {
   openTab(HOME_KEY, null, "OpenCode");
 }
 
-async function newSession() {
+async function newSession(split) {
   if (!(await ensureServer())) return;
   try {
     const res = await fetch(`${SERVER_URL}/session?directory=${encodeURIComponent(workspaceDir())}`, {
@@ -407,7 +410,7 @@ async function newSession() {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const session = await res.json();
     if (typeof session.id === "string") {
-      openSession(session.id, session.title || "New session");
+      openSession(session.id, session.title || "New session", split ? vscode.ViewColumn.Beside : undefined);
     } else {
       throw new Error("unexpected session id in server response");
     }
@@ -416,6 +419,55 @@ async function newSession() {
     openHome();
   }
   await sleep(800);
+  sendSessions();
+}
+
+const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+async function sessionApi(method, sessionId, body) {
+  if (!SESSION_ID_RE.test(sessionId)) return null;
+  if (!(await ensureServer())) return null;
+  const url = `${SERVER_URL}/session/${encodeURIComponent(sessionId)}?directory=${encodeURIComponent(workspaceDir())}`;
+  const res = await fetch(url, {
+    method,
+    headers: { "content-type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res;
+}
+
+async function renameSession(sessionId, currentTitle) {
+  const title = await vscode.window.showInputBox({
+    prompt: "Rename session",
+    value: currentTitle || "",
+    validateInput: (v) => (v.trim() ? undefined : "Title cannot be empty"),
+  });
+  if (title === undefined) return; // cancelled
+  try {
+    await sessionApi("PATCH", sessionId, { title: title.trim() });
+    const panel = panels.get(sessionId);
+    if (panel) panel.title = title.trim();
+  } catch (e) {
+    vscode.window.showErrorMessage(`OpenCode: rename failed (${e.message})`);
+  }
+  sendSessions();
+}
+
+async function deleteSession(sessionId, title) {
+  const pick = await vscode.window.showWarningMessage(
+    `Delete session "${title || sessionId}"? This cannot be undone.`,
+    { modal: true },
+    "Delete"
+  );
+  if (pick !== "Delete") return;
+  try {
+    await sessionApi("DELETE", sessionId);
+    const panel = panels.get(sessionId);
+    if (panel) panel.dispose();
+  } catch (e) {
+    vscode.window.showErrorMessage(`OpenCode: delete failed (${e.message})`);
+  }
   sendSessions();
 }
 
@@ -450,6 +502,12 @@ class SessionsSidebarProvider {
         case "openSession":
           if (typeof m.id === "string") openSession(m.id, typeof m.title === "string" ? m.title : undefined);
           break;
+        case "renameSession":
+          if (typeof m.id === "string") renameSession(m.id, typeof m.title === "string" ? m.title : "");
+          break;
+        case "deleteSession":
+          if (typeof m.id === "string") deleteSession(m.id, typeof m.title === "string" ? m.title : "");
+          break;
       }
     });
     view.onDidChangeVisibility(() => {
@@ -482,12 +540,22 @@ function sidebarHtml() {
   }
   input.search:focus { border-color: var(--vscode-focusBorder); }
   ul { list-style: none; margin: 0; padding: 0; }
-  li.session { padding: 5px 6px; border-radius: 4px; cursor: pointer; }
+  li.session { display: flex; align-items: center; gap: 6px; padding: 5px 6px; border-radius: 4px; cursor: pointer; }
   li.session:hover { background: var(--vscode-list-hoverBackground); }
   li.session.active { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
   li.session.active .meta { color: inherit; opacity: 0.75; }
+  li.session .dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--vscode-charts-blue); visibility: hidden; }
+  li.session.open .dot { visibility: visible; }
+  li.session .text { flex: 1; min-width: 0; }
   li.session .title { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   li.session .meta { display: block; font-size: 0.85em; color: var(--vscode-descriptionForeground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  li.session .actions { flex: none; display: none; gap: 2px; }
+  li.session:hover .actions { display: flex; }
+  li.session .actions button {
+    all: unset; cursor: pointer; padding: 2px; border-radius: 3px; line-height: 0; color: inherit;
+  }
+  li.session .actions button:hover { background: var(--vscode-toolbar-hoverBackground); }
+  li.session .actions svg { width: 14px; height: 14px; fill: currentColor; }
   .empty, .error { color: var(--vscode-descriptionForeground); padding: 8px 2px; }
   .error { color: var(--vscode-errorForeground); }
 </style>
@@ -502,6 +570,10 @@ function sidebarHtml() {
   let sessions = [];
   let workspace = "";
   let activeId = null;
+  let openIds = [];
+
+  const PENCIL = '<svg viewBox="0 0 16 16"><path d="M13.23 1h-1.46L3.52 9.25l-.16.22L1 13.59 2.41 15l4.12-2.36.22-.16L15 4.23V2.77L13.23 1zM2.41 13.59l1.51-3 1.45 1.45-2.96 1.55zm3.83-2.06L4.47 9.76l8-8 1.77 1.77-8 8z"/></svg>';
+  const TRASH = '<svg viewBox="0 0 16 16"><path d="M11 3h5v1h-1v10.5l-.5.5h-11l-.5-.5V4H2V3h5V1.5l.5-.5h3l.5.5V3zM6 3h4V2H6v1zM4 14h9V4H4v10zm2-8h1v6H6V6zm3 0h1v6H9V6z"/></svg>';
 
   document.getElementById("new").addEventListener("click", () => vscode.postMessage({ type: "newSession" }));
   document.getElementById("search").addEventListener("input", render);
@@ -528,8 +600,15 @@ function sidebarHtml() {
     }
     for (const s of shown) {
       const li = document.createElement("li");
-      li.className = s.id === activeId ? "session active" : "session";
+      li.className = "session" + (s.id === activeId ? " active" : "") + (openIds.includes(s.id) ? " open" : "");
       li.title = s.directory;
+
+      const dot = document.createElement("span");
+      dot.className = "dot";
+      dot.title = "Open in tab";
+
+      const text = document.createElement("span");
+      text.className = "text";
       const t = document.createElement("span");
       t.className = "title";
       t.textContent = s.title || s.id;
@@ -537,8 +616,27 @@ function sidebarHtml() {
       m.className = "meta";
       const sub = s.directory !== workspace ? " · " + s.directory.slice(workspace.length + 1) : "";
       m.textContent = relTime(s.time_updated) + sub;
-      li.appendChild(t);
-      li.appendChild(m);
+      text.appendChild(t);
+      text.appendChild(m);
+
+      const actions = document.createElement("span");
+      actions.className = "actions";
+      const mkBtn = (svg, tip, type) => {
+        const b = document.createElement("button");
+        b.innerHTML = svg;
+        b.title = tip;
+        b.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          vscode.postMessage({ type, id: s.id, title: s.title });
+        });
+        return b;
+      };
+      actions.appendChild(mkBtn(PENCIL, "Rename session", "renameSession"));
+      actions.appendChild(mkBtn(TRASH, "Delete session", "deleteSession"));
+
+      li.appendChild(dot);
+      li.appendChild(text);
+      li.appendChild(actions);
       li.addEventListener("click", () => vscode.postMessage({ type: "openSession", id: s.id, title: s.title }));
       list.appendChild(li);
     }
@@ -555,6 +653,7 @@ function sidebarHtml() {
     sessions = msg.sessions || [];
     workspace = msg.workspace || "";
     if ("activeId" in msg) activeId = msg.activeId || null;
+    openIds = Array.isArray(msg.openIds) ? msg.openIds : [];
     document.getElementById("status").textContent = "";
     if (msg.error) {
       const d = document.createElement("div");
@@ -600,6 +699,11 @@ function activate(context) {
   );
   context.subscriptions.push(
     vscode.commands.registerCommand("opencode-v2.openHome", () => openHome())
+  );
+  context.subscriptions.push(
+    // Editor-title OC button, mirroring Claude Code's "Claude Code: Open":
+    // a fresh session beside the current editor.
+    vscode.commands.registerCommand("opencode-v2.newSessionSplit", () => newSession(true))
   );
   context.subscriptions.push(
     vscode.commands.registerCommand("opencode-v2.openExternal", async () => {

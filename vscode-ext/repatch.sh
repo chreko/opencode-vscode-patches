@@ -47,6 +47,10 @@ if not views or views[0].get('type') != 'webview':
                              ('opencode-v2.openExternal', 'OpenCode: Open in Browser', '$(link-external)')]:
         if cmd not in cmds:
             c['commands'].append({'command': cmd, 'title': title, 'icon': icon})
+    if 'opencode-v2.newSessionSplit' not in cmds:
+        c['commands'].append({'command': 'opencode-v2.newSessionSplit', 'title': 'OpenCode: Open',
+                              'icon': {'light': 'images/button-dark.svg', 'dark': 'images/button-light.svg'}})
+    c['menus']['editor/title'] = [{'command': 'opencode-v2.newSessionSplit', 'group': 'navigation'}]
     c.setdefault('menus', {})['view/title'] = [
         {'command': 'opencode-v2.newSession', 'when': 'view == opencode-v2.panel', 'group': 'navigation@1'},
         {'command': 'opencode-v2.refreshSessions', 'when': 'view == opencode-v2.panel', 'group': 'navigation@2'},
